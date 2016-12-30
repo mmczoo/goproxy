@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"sync/atomic"
@@ -109,6 +110,15 @@ func (proxy *ProxyHttpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 
 		if resp == nil {
 			removeProxyHeaders(ctx, r)
+
+			ctx.RoundTripper = RoundTripperFunc(func(req *http.Request, ctx *ProxyCtx) (*http.Response, error) {
+				proxyUrl, _ := url.Parse("http://119.254.92.53:80")
+				transport := &http.Transport{
+					Proxy: http.ProxyURL(proxyUrl),
+				}
+				return transport.RoundTrip(req)
+			})
+
 			resp, err = ctx.RoundTrip(r)
 			if err != nil {
 				ctx.Error = err
