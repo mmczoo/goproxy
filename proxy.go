@@ -2,7 +2,10 @@ package goproxy
 
 import (
 	"bufio"
+	"crypto/tls"
+	"encoding/json"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -10,7 +13,17 @@ import (
 	"os"
 	"regexp"
 	"sync/atomic"
+	"time"
+
+	"golang.org/x/net/proxy"
+
+	hproxy "github.com/mmczoo/gotools/proxy"
+	"github.com/xlvector/dlog"
 )
+
+type ProxyPx struct {
+	PxMgr *hproxy.ProxyMgr
+}
 
 // The basic proxy type. Implements http.Handler.
 type ProxyHttpServer struct {
@@ -28,6 +41,8 @@ type ProxyHttpServer struct {
 	// ConnectDial will be used to create TCP connections for CONNECT requests
 	// if nil Tr.Dial will be used
 	ConnectDial func(network string, addr string) (net.Conn, error)
+
+	px *ProxyPx
 }
 
 var hasPort = regexp.MustCompile(`:\d+$`)
@@ -103,6 +118,12 @@ func (proxy *ProxyHttpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		var err error
 		ctx.Logf("Got request %v %v %v %v", r.URL.Path, r.Host, r.Method, r.URL.String())
 		if !r.URL.IsAbs() {
+			if proxy.px != nil {
+				ret := proxy.px.PxMgr.GetIpst()
+				b, _ := json.Marshal(ret)
+				w.Write(b)
+				return
+			}
 			proxy.NonproxyHandler.ServeHTTP(w, r)
 			return
 		}
@@ -111,13 +132,9 @@ func (proxy *ProxyHttpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		if resp == nil {
 			removeProxyHeaders(ctx, r)
 
-			ctx.RoundTripper = RoundTripperFunc(func(req *http.Request, ctx *ProxyCtx) (*http.Response, error) {
-				proxyUrl, _ := url.Parse("http://119.254.92.53:80")
-				transport := &http.Transport{
-					Proxy: http.ProxyURL(proxyUrl),
-				}
-				return transport.RoundTrip(req)
-			})
+			if proxy.px != nil {
+				proxy.setRoundTrip(ctx)
+			}
 
 			resp, err = ctx.RoundTrip(r)
 			if err != nil {
@@ -169,4 +186,143 @@ func NewProxyHttpServer() *ProxyHttpServer {
 	}
 	proxy.ConnectDial = dialerFromEnv(&proxy)
 	return &proxy
+}
+
+func (p *ProxyHttpServer) setRoundTrip(ctx *ProxyCtx) {
+	ctx.RoundTripper = RoundTripperFunc(func(req *http.Request, ctx *ProxyCtx) (*http.Response, error) {
+		px := p.px.PxMgr.Get()
+		if px == nil {
+			return p.Tr.RoundTrip(req)
+		}
+
+		transport := &http.Transport{
+			DisableKeepAlives:     true,
+			ResponseHeaderTimeout: time.Second * 20,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+				MaxVersion:         tls.VersionTLS12,
+				MinVersion:         tls.VersionTLS10,
+				CipherSuites: []uint16{
+					tls.TLS_RSA_WITH_RC4_128_SHA,
+					tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA,
+					tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+					tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+					tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA,
+					tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+					tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+					tls.TLS_ECDHE_RSA_WITH_RC4_128_SHA,
+					tls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
+					tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+					tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+					tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+					tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+				},
+			},
+		}
+
+		if px.Type == "socks5" {
+			var auth *proxy.Auth
+			if len(px.Username) > 0 && len(px.Password) > 0 {
+				auth = &proxy.Auth{
+					User:     px.Username,
+					Password: px.Password,
+				}
+			} else {
+				auth = &proxy.Auth{}
+			}
+			forward := proxy.FromEnvironment()
+			dialSocks5Proxy, err := proxy.SOCKS5("tcp", px.IP, auth, forward)
+			if err != nil {
+				dlog.Warn("SetSocks5 Error:%s", err.Error())
+				return p.Tr.RoundTrip(req)
+			}
+			transport.Dial = dialSocks5Proxy.Dial
+		} else if px.Type == "http" || px.Type == "https" {
+			transport.Dial = func(netw, addr string) (net.Conn, error) {
+				timeout := time.Second * 5
+				deadline := time.Now().Add(timeout)
+				c, err := net.DialTimeout(netw, addr, timeout)
+				if err != nil {
+					return nil, err
+				}
+				c.SetDeadline(deadline)
+				return c, nil
+			}
+			proxyUrl, err := url.Parse(px.String())
+			if err == nil {
+				transport.Proxy = http.ProxyURL(proxyUrl)
+			}
+		} else if px.Type == "socks4" {
+			surl := "socks4://" + px.IP
+			rsurl, err := url.Parse(surl)
+			if err != nil {
+				dlog.Warn("socks4 url parse: %v", err)
+				return p.Tr.RoundTrip(req)
+			}
+			forward := proxy.FromEnvironment()
+			dialersocks4, err := proxy.FromURL(rsurl, forward)
+			if err != nil {
+				dlog.Warn("SetSocks4 Error:%s", err.Error())
+				return p.Tr.RoundTrip(req)
+			}
+			transport.Dial = dialersocks4.Dial
+		}
+
+		return transport.RoundTrip(req)
+	})
+}
+
+type Config struct {
+	Ssdb  *hproxy.Ssdb  `json:"ssdb"`
+	Redis *hproxy.Redis `json:"redis"`
+}
+
+func NewConfig(fname string) *Config {
+	f, err := os.Open(fname)
+	if err != nil {
+		dlog.Error("fail to open confile file! %s", fname, err)
+		return nil
+	}
+	defer f.Close()
+
+	data, err := ioutil.ReadAll(f)
+	if err != nil {
+		dlog.Error("fail to read confile file! %s", fname, err)
+		return nil
+	}
+
+	p := &Config{}
+	err = json.Unmarshal(data, p)
+	if err != nil {
+		dlog.Error("fail to unmarshal! %s", fname, err)
+		return nil
+	}
+
+	return p
+}
+
+func NewProxyHttpServerWithPx(fn string) *ProxyHttpServer {
+	if len(fn) == 0 {
+		log.Fatalf("config file fail!")
+	}
+
+	cfg := NewConfig(fn)
+	if cfg == nil {
+		log.Fatalf("config file fail!!")
+	}
+
+	phs := NewProxyHttpServer()
+	if cfg.Ssdb != nil {
+		phs.px = &ProxyPx{
+			PxMgr: hproxy.NewProxyMgrWithSsdb(cfg.Ssdb),
+		}
+	} else if cfg.Redis != nil {
+		phs.px = &ProxyPx{
+			PxMgr: hproxy.NewProxyMgr(cfg.Redis),
+		}
+	} else {
+		log.Fatalf("config file fail!!!")
+	}
+
+	return phs
 }
