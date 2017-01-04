@@ -132,8 +132,9 @@ func (proxy *ProxyHttpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 		if resp == nil {
 			removeProxyHeaders(ctx, r)
 
+			var rpx *hproxy.Proxy
 			if proxy.px != nil {
-				proxy.setRoundTrip(ctx)
+				rpx = proxy.setRoundTrip(ctx)
 			}
 
 			resp, err = ctx.RoundTrip(r)
@@ -145,6 +146,9 @@ func (proxy *ProxyHttpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) 
 					http.Error(w, err.Error(), 500)
 					return
 				}
+			}
+			if rpx != nil {
+				proxy.px.PxMgr.FeedBack(rpx)
 			}
 			ctx.Logf("Received response %v", resp.Status)
 		}
@@ -188,13 +192,12 @@ func NewProxyHttpServer() *ProxyHttpServer {
 	return &proxy
 }
 
-func (p *ProxyHttpServer) setRoundTrip(ctx *ProxyCtx) {
+func (p *ProxyHttpServer) setRoundTrip(ctx *ProxyCtx) *hproxy.Proxy {
+	px := p.px.PxMgr.Get()
+	if px == nil {
+		return nil
+	}
 	ctx.RoundTripper = RoundTripperFunc(func(req *http.Request, ctx *ProxyCtx) (*http.Response, error) {
-		px := p.px.PxMgr.Get()
-		if px == nil {
-			return p.Tr.RoundTrip(req)
-		}
-
 		transport := &http.Transport{
 			DisableKeepAlives:     true,
 			ResponseHeaderTimeout: time.Second * 20,
@@ -270,6 +273,8 @@ func (p *ProxyHttpServer) setRoundTrip(ctx *ProxyCtx) {
 
 		return transport.RoundTrip(req)
 	})
+
+	return px
 }
 
 type Config struct {
